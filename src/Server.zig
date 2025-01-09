@@ -124,6 +124,9 @@ fn handleConnection(allocator: std.mem.Allocator, connection: Connection, list: 
             break :blk;
         };
         _ = list.swapRemove(index);
+        clientUpdated(allocator, list.items) catch |err| {
+            std.log.err("failed to update clients: {}", .{err});
+        };
     }
 
     // the first message is the alias
