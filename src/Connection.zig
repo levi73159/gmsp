@@ -16,19 +16,57 @@ pub const Action = enum(u8) {
     message = 0,
     change_alias = 1,
     on_client_update = 2, // anything from changing alias to joining a room
+    user_info = 3, // the user is sending his info, username and password
     _,
 };
 
+// every data is temporary, because it will point to data in the reader which is a buffer, if you want to keep
+// it around, you need to copy it somewhere else
+// operates as segments, like a matrix kinda, where each segment will hold a message
 pub const Data = struct {
     action: Action,
-    data: []const u8,
+    segments: []const []const u8,
+    allocator: ?std.mem.Allocator,
 
-    pub fn ptr(self: Data) [*]const u8 {
-        return self.data.ptr;
+    // assumes that segments are already allocated with the allocaotr
+    pub fn init(allocator: ?std.mem.Allocator, action: Action, segments: []const []const u8) Data {
+        return .{
+            .action = action,
+            .segments = segments,
+            .allocator = allocator,
+        };
     }
 
+    /// # careful, this will copy the data and this won't allocate any memory so never call deinit
+    pub fn single(action: Action, data: []const u8) Data {
+        return .{
+            .action = action,
+            .segments = &[_][]const u8{data},
+            .allocator = null,
+        };
+    }
+
+    pub fn deinit(self: Data) void {
+        if (self.allocator == null) return;
+        self.allocator.?.free(self.segments);
+    }
+
+    pub fn segment(self: Data, index: usize) []const u8 {
+        return self.segments[index];
+    }
+
+    /// returns the number of segments
+    pub fn segmentCount(self: Data) usize {
+        return self.segments.len;
+    }
+
+    /// gets the length of the data all combined, not counting any header or padding we may have
     pub fn len(self: Data) usize {
-        return self.data.len;
+        var _len: usize = 0;
+        for (self.segments) |seg| {
+            _len += seg.len;
+        }
+        return _len;
     }
 };
 
@@ -40,7 +78,7 @@ pub fn init(allocator: std.mem.Allocator, address: std.net.Address, socket: std.
         .socket = socket,
         .reader = .{
             .socket = socket,
-            .buf = allocator.alloc(u8, 3024) catch unreachable,
+            .buf = allocator.alloc(u8, 30240) catch unreachable,
         },
     };
 }
@@ -60,7 +98,8 @@ pub fn changeAlias(self: *Self, alias: []const u8) !void {
     @memcpy(self.alias, alias);
 }
 
-pub fn writeAll(self: Self, bytes: []const u8) !void {
+/// DEPRECATED
+fn writeAll(self: Self, bytes: []const u8) !void {
     var pos: usize = 0;
     while (pos < bytes.len) {
         const written = try posix.write(self.socket, bytes[pos..]);
@@ -101,50 +140,46 @@ pub fn readAll(self: Self, buf: []u8) !void {
 
 pub fn writeAction(self: Self, data: Data) !void {
     var action_buf: [1]u8 = undefined;
-    std.mem.writeInt(u8, &action_buf, @intFromEnum(data.action), .little); // to make it little endian
+    std.mem.writeInt(std.meta.Tag(Action), &action_buf, @intFromEnum(data.action), .little); // to make it little endian
 
-    var size_buf: [4]u8 = undefined;
-    std.mem.writeInt(u32, &size_buf, @intCast(data.len()), .little);
+    var amount_buf: [1]u8 = undefined;
+    std.mem.writeInt(u8, &amount_buf, @intCast(data.segmentCount()), .little);
 
-    var vec = [_]posix.iovec_const{
-        .{ .base = &action_buf, .len = action_buf.len },
-        .{ .base = &size_buf, .len = size_buf.len },
-        .{ .base = data.ptr(), .len = data.len() },
-    };
-    try self.writeAllVectored(&vec);
+    var iovev_const_buf: [500]posix.iovec_const = undefined;
+
+    iovev_const_buf[0] = .{ .base = &action_buf, .len = action_buf.len };
+    iovev_const_buf[1] = .{ .base = &amount_buf, .len = amount_buf.len };
+
+    var count: usize = 2;
+    for (data.segments, 2..) |segment, i| {
+        iovev_const_buf[i] = .{ .base = segment.ptr, .len = segment.len };
+        count = i + 1;
+    }
+
+    try self.writeAllVectored(iovev_const_buf[0..count]);
 }
 
 pub fn writeMessage(self: Self, message: []const u8) !void {
-    try self.writeAction(.{ .data = message, .action = .message });
-}
-
-/// Data is guaranteed to be a message or an error
-/// returns `error.UnexpectedAction` if the data is not a message
-pub fn get(self: Self, name: []const u8) !Data {
-    try self.writeAction(.get, name);
-    const data = try self.reader.readData();
-    if (data.action == .err) {
-        return Data{ .err = data.data };
-    }
-    if (data.action != .message) {
-        return error.UnexpectedAction;
-    }
-    return Data{ .message = data.data };
+    try self.writeAction(Data.single(.message, message));
 }
 
 // asserts that the aation is message
 pub fn readMessage(self: *Self) ![]u8 {
-    const data = try self.reader.readData();
+    const data = try self.readData();
+    defer data.deinit(); // only deinitlize the data, not the segments
     std.debug.assert(data.action == .message);
-    return data.data;
+    std.debug.assert(data.segments.len == 1);
+
+    return data.segment(0);
 }
 
 pub fn readData(self: *Self) !Data {
-    const data = try self.reader.readData();
-
+    var data = try self.reader.readData(self.allocator);
+    const owned = data.toOwned();
     return Data{
-        .data = data.data,
-        .action = data.action,
+        .segments = owned.segments,
+        .action = owned.action,
+        .allocator = owned.allocator,
     };
 }
 

@@ -91,7 +91,7 @@ fn clientUpdated(allocator: std.mem.Allocator, connections: []const Connection) 
         message.append('\n') catch unreachable;
     }
 
-    try broadcastData(.{ .action = .on_client_update, .data = message.items }, null, connections);
+    try broadcastData(Connection.Data.single(.on_client_update, message.items), null, connections);
 }
 
 fn connPrint(message: []const u8, connection: Connection) void {
@@ -130,14 +130,16 @@ fn handleConnection(allocator: std.mem.Allocator, connection: Connection, list: 
     }
 
     // the first message is the alias
-    const alias = ptr.readData() catch |err| {
-        std.log.err("failed to read alias: {}", .{err});
-        return;
-    };
-    ptr.alias = ptr.allocator.dupe(u8, alias.data) catch @panic("out of memory");
-    if (std.mem.containsAtLeast(u8, ptr.alias, 1, ":")) {
-        connLog("invalid alias", ptr.*, std.log.err);
-        return;
+    {
+        const alias = ptr.readData() catch |err| {
+            std.log.err("failed to read alias: {}", .{err});
+            return;
+        };
+        ptr.alias = ptr.allocator.dupe(u8, alias.segment(0)) catch @panic("out of memory");
+        if (std.mem.containsAtLeast(u8, ptr.alias, 1, ":")) {
+            connLog("invalid alias", ptr.*, std.log.err);
+            return;
+        }
     }
 
     var tmp_buf: [2024]u8 = undefined;
@@ -152,10 +154,11 @@ fn handleConnection(allocator: std.mem.Allocator, connection: Connection, list: 
             std.log.err("failed to read message: {}", .{err});
             return;
         };
+        defer data.deinit();
 
         switch (data.action) {
             .message => {
-                const full_msg = std.fmt.bufPrint(&tmp_buf, "{s}: {s}", .{ ptr.alias, data.data }) catch unreachable;
+                const full_msg = std.fmt.bufPrint(&tmp_buf, "{s}: {s}", .{ ptr.alias, data.segment(0) }) catch unreachable;
                 std.log.info("{s}", .{full_msg});
                 broadcast(full_msg, ptr.*, list.items) catch |err| {
                     std.log.err("failed to broadcast message: {}", .{err});
@@ -163,7 +166,7 @@ fn handleConnection(allocator: std.mem.Allocator, connection: Connection, list: 
                 };
             },
             .change_alias => {
-                ptr.changeAlias(data.data) catch |err| {
+                ptr.changeAlias(data.segment(0)) catch |err| {
                     std.log.err("failed to change alias: {}", .{err});
                     return;
                 };
@@ -171,6 +174,16 @@ fn handleConnection(allocator: std.mem.Allocator, connection: Connection, list: 
                     std.log.err("failed to update clients: {}", .{err});
                     return;
                 };
+            },
+            .user_info => {
+                // user info will come with a username and password (will be encrypted later)
+                if (data.segmentCount() != 2) {
+                    connLog("invalid user info", ptr.*, std.log.err);
+                    return;
+                }
+                const username = data.segment(0);
+                const password = data.segment(1);
+                std.log.info("user info: {s} {s}", .{ username, password });
             },
 
             .on_client_update => {

@@ -20,41 +20,51 @@ socket: posix.socket_t,
 
 pub const Data = struct {
     action: Action,
-    data: []u8,
+    segments: std.ArrayList([]u8),
+
+    pub const Owned = struct {
+        action: Action,
+        segments: [][]u8,
+        allocator: std.mem.Allocator,
+
+        pub fn deinit(self: Owned) void {
+            self.allocator.free(self.segments);
+        }
+    };
+
+    pub fn init(allocator: std.mem.Allocator, action: Action) Data {
+        return Data{
+            .action = action,
+            .segments = std.ArrayList([]u8).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: Data) void {
+        self.segments.deinit();
+    }
+
+    pub fn toOwned(self: *Data) Owned {
+        return Owned{
+            .action = self.action,
+            .segments = self.segments.toOwnedSlice() catch unreachable,
+            .allocator = self.segments.allocator,
+        };
+    }
+
+    pub fn addSegment(self: *Data, data: []u8) void {
+        self.segments.append(data) catch unreachable;
+    }
 };
 
-pub fn readData(self: *Self) !Data {
+pub fn readData(self: *Self, allocator: std.mem.Allocator) !Data {
     var buf = self.buf;
 
     // loop until we've read a message, or the connection was closed
     while (true) {
 
         // Check if we already have a message in our buffer
-        if (try self.bufferedData()) |data| {
+        if (try self.bufferedData(allocator)) |data| {
             return data;
-        }
-
-        // read data from the socket, we need to read this into buf from
-        // the end of where we have data (aka, self.pos)
-        const pos = self.pos;
-        const n = try posix.read(self.socket, buf[pos..]);
-        if (n == 0) {
-            return error.Closed;
-        }
-
-        self.pos = pos + n;
-    }
-}
-
-pub fn readMessage(self: *Self) ![]u8 {
-    var buf = self.buf;
-
-    // loop until we've read a message, or the connection was closed
-    while (true) {
-
-        // Check if we already have a message in our buffer
-        if (try self.bufferedMessage()) |msg| {
-            return msg;
         }
 
         // read data from the socket, we need to read this into buf from
@@ -80,7 +90,7 @@ pub fn flush(self: Self) void {
 // checks if there's a full data in self.buf already
 // If there isn't, checks that we have enough spare space in self.buf for
 // the next data
-fn bufferedData(self: *Self) !?Data {
+fn bufferedData(self: *Self, allocator: std.mem.Allocator) !?Data {
     const buf = self.buf;
     // position up to where we have valid data
     const pos = self.pos;
@@ -92,11 +102,11 @@ fn bufferedData(self: *Self) !?Data {
     // but that we haven't yet returned as a "data" - possibly because
     // its incomplete.
     std.debug.assert(pos >= start);
-    const unprocessed = buf[start..pos];
+    var unprocessed = buf[start..pos];
 
-    // we always need 5 bytes of data (the action prefix and the length prefix)
-    if (unprocessed.len < 5) {
-        self.ensureSpace(5 - unprocessed.len) catch unreachable;
+    // we always need two bytes, one for the action and one for the amount of data
+    if (unprocessed.len < 2) {
+        self.ensureSpace(2 - unprocessed.len) catch unreachable;
         return null;
     }
 
@@ -104,70 +114,59 @@ fn bufferedData(self: *Self) !?Data {
     const action = std.mem.readInt(u8, unprocessed[0..1], .little);
     const action_enum: Action = @enumFromInt(action);
 
-    // the length of the data
-    const data_len: u32 = std.mem.readInt(u32, unprocessed[1..5], .little);
+    std.log.debug("Action: {s}", .{@tagName(action_enum)});
 
-    // the length of our data + the length of our prefix
-    const total_len = data_len + 5;
+    // The amount of data we are sending can be zero
+    const amount_len = std.mem.readInt(u8, unprocessed[1..2], .little);
 
-    if (unprocessed.len < total_len) {
-        // We know the length of the data, but we don't have all the
-        // bytes yet.
-        try self.ensureSpace(total_len);
-        return null;
+    std.log.debug("Amount: {d}", .{amount_len});
+
+    var data = Data.init(allocator, action_enum);
+
+    if (amount_len == 0) {
+        return data;
+    }
+
+    var i: u8 = 0;
+    var total_packet_len: usize = 2; // 2 for header
+    while (i < amount_len) : (i += 1) {
+        // check if we have 4 bytes for the data len
+        std.log.debug("Segment {d}", .{i});
+        if (unprocessed.len < 4) {
+            self.ensureSpace(4 - unprocessed.len) catch unreachable;
+            return null;
+        }
+
+        // the length of this data segment
+        const data_len = std.mem.readInt(u32, unprocessed[2..6], .little);
+
+        std.log.debug("Data len {d}", .{data_len});
+
+        // the length of our data + the length of our prefix which is 2 bytes (action and amount) + 4 (data seg len)
+        const total_len = data_len + 4;
+
+        std.log.debug("Total len {d}", .{total_len});
+
+        if (unprocessed.len < total_len) {
+            // We know the length of the data, but we don't have all the
+            // bytes yet.
+            try self.ensureSpace(total_len);
+            return null;
+        }
+
+        const segment = unprocessed[total_packet_len + 4 ..][0..data_len];
+        total_packet_len += total_len;
+        data.addSegment(segment);
+        std.log.debug("Added segment: {s}", .{segment});
+        std.log.debug("RAW: {any}", .{segment});
     }
 
     // Position start at the start of the next message. We might not have
     // any data for this next message, but we know that it'll start where
     // our last message ended.
-    self.start += total_len;
-    return Data{
-        .action = action_enum,
-        .data = unprocessed[5..total_len],
-    };
-}
+    self.start += total_packet_len;
 
-// Checks if there's a full message in self.buf already.
-// If there isn't, checks that we have enough spare space in self.buf for
-// the next message.
-fn bufferedMessage(self: *Self) !?[]u8 {
-    const buf = self.buf;
-    // position up to where we have valid data
-    const pos = self.pos;
-
-    // position where the next message start
-    const start = self.start;
-
-    // pos - start represents bytes that we've read from the socket
-    // but that we haven't yet returned as a "message" - possibly because
-    // its incomplete.
-    std.debug.assert(pos >= start);
-    const unprocessed = buf[start..pos];
-
-    if (unprocessed.len < 4) {
-        // We always need at least 4 bytes of data (the length prefix)
-        self.ensureSpace(4 - unprocessed.len) catch unreachable;
-        return null;
-    }
-
-    // The length of the message
-    const message_len = std.mem.readInt(u32, unprocessed[0..4], .little);
-
-    // the length of our message + the length of our prefix
-    const total_len = message_len + 4;
-
-    if (unprocessed.len < total_len) {
-        // We know the length of the message, but we don't have all the
-        // bytes yet.
-        try self.ensureSpace(total_len);
-        return null;
-    }
-
-    // Position start at the start of the next message. We might not have
-    // any data for this next message, but we know that it'll start where
-    // our last message ended.
-    self.start += total_len;
-    return unprocessed[4..total_len];
+    return data;
 }
 
 // We want to make sure we have enough spare space in our buffer. This can
