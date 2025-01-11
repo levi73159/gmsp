@@ -136,9 +136,11 @@ fn bufferedData(self: *Self, allocator: std.mem.Allocator) !?Data {
             self.ensureSpace(4 - unprocessed.len) catch unreachable;
             return null;
         }
+        const segment_start = total_packet_len;
 
         // the length of this data segment
-        const data_len = std.mem.readInt(u32, unprocessed[2..6], .little);
+        const data_len = std.mem.readInt(u32, unprocessed[segment_start..][0..4], .little);
+        const segment = unprocessed[total_packet_len + 4 ..][0..data_len];
 
         std.log.debug("Data len {d}", .{data_len});
 
@@ -154,7 +156,6 @@ fn bufferedData(self: *Self, allocator: std.mem.Allocator) !?Data {
             return null;
         }
 
-        const segment = unprocessed[total_packet_len + 4 ..][0..data_len];
         total_packet_len += total_len;
         data.addSegment(segment);
         std.log.debug("Added segment: {s}", .{segment});

@@ -184,6 +184,17 @@ fn handleConnection(allocator: std.mem.Allocator, connection: Connection, list: 
                 const username = data.segment(0);
                 const password = data.segment(1);
                 std.log.info("user info: {s} {s}", .{ username, password });
+                // send error right now
+                const response = Connection.Data.alloc(allocator, .err, &[_][]const u8{"Invalid username or password"});
+                defer response.deinit();
+
+                std.log.info("sending error", .{});
+                std.log.debug("packet segment 0: {s}", .{response.segment(0)});
+
+                ptr.writeAction(response) catch |err| {
+                    std.log.err("failed to send error: {}", .{err});
+                    return;
+                };
             },
 
             .on_client_update => {

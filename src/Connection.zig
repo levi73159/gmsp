@@ -17,6 +17,8 @@ pub const Action = enum(u8) {
     change_alias = 1,
     on_client_update = 2, // anything from changing alias to joining a room
     user_info = 3, // the user is sending his info, username and password
+    success = 4,
+    err = 5,
     _,
 };
 
@@ -33,6 +35,14 @@ pub const Data = struct {
         return .{
             .action = action,
             .segments = segments,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn alloc(allocator: std.mem.Allocator, action: Action, segments: []const []const u8) Data {
+        return .{
+            .action = action,
+            .segments = allocator.dupe([]const u8, segments) catch unreachable,
             .allocator = allocator,
         };
     }
@@ -111,14 +121,17 @@ fn writeAll(self: Self, bytes: []const u8) !void {
 fn writeAllVectored(self: Self, vec: []posix.iovec_const) !void {
     var i: usize = 0;
     while (true) {
-        var n = try posix.writev(self.socket, vec[i..]);
-        while (n >= vec[i].len) {
-            n -= vec[i].len;
+        var bytes_written: usize = try posix.writev(self.socket, vec[i..]);
+        std.log.debug("Bytes written: {d}", .{bytes_written});
+        if (bytes_written == 0) return error.Closed;
+        while (bytes_written >= vec[i].len) {
+            bytes_written -= vec[i].len;
             i += 1;
+            std.log.debug("Incremented: {d}", .{i});
             if (i >= vec.len) return;
         }
-        vec[i].base += n;
-        vec[i].len -= n;
+        vec[i].base += bytes_written;
+        vec[i].len -= bytes_written;
     }
 }
 
@@ -139,24 +152,39 @@ pub fn readAll(self: Self, buf: []u8) !void {
 }
 
 pub fn writeAction(self: Self, data: Data) !void {
+    std.log.debug("Sending data: {s}", .{data.segment(0)});
+
     var action_buf: [1]u8 = undefined;
     std.mem.writeInt(std.meta.Tag(Action), &action_buf, @intFromEnum(data.action), .little); // to make it little endian
 
     var amount_buf: [1]u8 = undefined;
     std.mem.writeInt(u8, &amount_buf, @intCast(data.segmentCount()), .little);
 
-    var iovev_const_buf: [500]posix.iovec_const = undefined;
+    var iovec_const_buf: [500]posix.iovec_const = undefined;
 
-    iovev_const_buf[0] = .{ .base = &action_buf, .len = action_buf.len };
-    iovev_const_buf[1] = .{ .base = &amount_buf, .len = amount_buf.len };
+    iovec_const_buf[0] = .{ .base = &action_buf, .len = action_buf.len };
+    iovec_const_buf[1] = .{ .base = &amount_buf, .len = amount_buf.len };
+
+    const segment_header_bufs: [][4]u8 = try self.allocator.alloc([4]u8, data.segmentCount());
+    defer self.allocator.free(segment_header_bufs);
 
     var count: usize = 2;
-    for (data.segments, 2..) |segment, i| {
-        iovev_const_buf[i] = .{ .base = segment.ptr, .len = segment.len };
-        count = i + 1;
+    const end_count = 2 + data.segmentCount() * 2;
+    var index: usize = 0;
+    // each segment needs a header of 4 bytes, and the actuall data so * 2
+    while (count < end_count) : ({
+        count += 2;
+        index += 1;
+    }) {
+        var segment_header_buf = segment_header_bufs[index];
+        std.mem.writeInt(u32, &segment_header_buf, @intCast(data.segment(index).len), .little);
+        iovec_const_buf[count] = .{ .base = &segment_header_buf, .len = segment_header_buf.len };
+        iovec_const_buf[count + 1] = .{ .base = data.segment(index).ptr, .len = data.segment(index).len };
     }
 
-    try self.writeAllVectored(iovev_const_buf[0..count]);
+    std.log.debug("Count: {d}", .{count});
+
+    try self.writeAllVectored(iovec_const_buf[0..count]);
 }
 
 pub fn writeMessage(self: Self, message: []const u8) !void {
