@@ -16,9 +16,11 @@ pub const Action = enum(u8) {
     message = 0,
     change_alias = 1,
     on_client_update = 2, // anything from changing alias to joining a room
-    user_info = 3, // the user is sending his info, username and password
-    success = 4,
-    err = 5,
+    login = 3,
+    signup = 4,
+    success = 5,
+    err = 6,
+    get_name = 7,
     _,
 };
 
@@ -47,13 +49,12 @@ pub const Data = struct {
         };
     }
 
-    /// # careful, this will copy the data and this won't allocate any memory so never call deinit
-    pub fn single(action: Action, data: []const u8) Data {
-        return .{
-            .action = action,
-            .segments = &[_][]const u8{data},
-            .allocator = null,
-        };
+    pub fn success(allocator: std.mem.Allocator, response: []const u8) Data {
+        return alloc(allocator, .success, &[_][]const u8{response});
+    }
+
+    pub fn err(allocator: std.mem.Allocator, response: []const u8) Data {
+        return alloc(allocator, .err, &[_][]const u8{response});
     }
 
     pub fn deinit(self: Data) void {
@@ -188,7 +189,9 @@ pub fn writeAction(self: Self, data: Data) !void {
 }
 
 pub fn writeMessage(self: Self, message: []const u8) !void {
-    try self.writeAction(Data.single(.message, message));
+    const data = Data.alloc(self.allocator, .message, &[_][]const u8{message});
+    defer data.deinit();
+    try self.writeAction(data);
 }
 
 // asserts that the aation is message

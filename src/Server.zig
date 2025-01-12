@@ -58,6 +58,179 @@ pub fn run(addr: net.Address) !void {
     }
 }
 
+const User = struct {
+    const filepath = "users.dat";
+    fn insureExists() !void {
+        const file = std.fs.cwd().createFile(User.filepath, std.fs.File.CreateFlags{ .truncate = false }) catch |err| switch (err) {
+            error.PathAlreadyExists => {
+                std.log.debug("user file already exists...", .{});
+                return;
+            },
+            else => return err,
+        };
+        file.close();
+    }
+    fn openUsersFile() !std.fs.File {
+        try insureExists();
+        return std.fs.cwd().openFile(User.filepath, std.fs.File.OpenFlags{ .mode = .read_write });
+    }
+
+    username: []const u8,
+    password: []const u8,
+
+    pub fn deinit(self: User, allocator: std.mem.Allocator) void {
+        allocator.free(self.username);
+        allocator.free(self.password);
+    }
+};
+
+fn translateUserFile(allocator: std.mem.Allocator) ![]const User {
+    const file = try User.openUsersFile();
+
+    // each user will have an 8 byte header
+    // split into 4 bytes (the username length) and 4 bytes (the password length)
+    // followed by the username and password
+    // the username and password will not be null terminated since they have a length prefix
+    var users = std.ArrayList(User).init(allocator);
+    errdefer {
+        for (users.items) |user| {
+            user.deinit(allocator);
+        }
+        users.deinit();
+    }
+
+    const reader = file.reader();
+    while (true) {
+        const username_len = reader.readInt(u32, .big) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        const password_len = try reader.readInt(u32, .big);
+
+        const username = allocator.alloc(u8, username_len) catch unreachable;
+        errdefer allocator.free(username);
+
+        const password = allocator.alloc(u8, password_len) catch unreachable;
+        errdefer allocator.free(password);
+
+        var amount = try file.readAll(username);
+        if (amount != username_len) return error.EndOfStream; // should never happen but just in case the file is wrong
+
+        amount = try file.readAll(password);
+        if (amount != password_len) return error.EndOfStream; // should never happen but just in case the file is wrong
+
+        users.append(.{ .username = username, .password = password }) catch unreachable;
+    }
+
+    return users.toOwnedSlice();
+}
+fn freeUsers(users: []const User, allocator: std.mem.Allocator) void {
+    for (users) |user| {
+        user.deinit(allocator);
+    }
+    allocator.free(users);
+}
+fn addUser(user: User) !void {
+    const file = User.openUsersFile() catch |err| {
+        std.log.err("failed to open user file: {}", .{err});
+        return err;
+    };
+    defer file.close();
+
+    try file.seekFromEnd(0); // so we can append instead of overwrite
+
+    const writer = file.writer();
+
+    try writer.writeInt(u32, @intCast(user.username.len), .big);
+    try writer.writeInt(u32, @intCast(user.password.len), .big);
+    try writer.writeAll(user.username);
+    try writer.writeAll(user.password);
+}
+
+fn handleLogin(allocator: std.mem.Allocator, connection: *Connection, connections: []const Connection, data: Connection.Data) !void {
+    if (data.segmentCount() != 2) {
+        return error.InvalidData;
+    }
+
+    const username = data.segment(0);
+    const password = data.segment(1);
+
+    const users = translateUserFile(allocator) catch |err| {
+        std.log.err("failed to translate user file: {}", .{err});
+        return err;
+    };
+    defer freeUsers(users, allocator);
+
+    for (users) |user| {
+        if (std.mem.eql(u8, username, user.username) and std.mem.eql(u8, password, user.password)) {
+            try connection.changeAlias(username);
+            const response = Connection.Data.alloc(allocator, .success, &[_][]const u8{"Login successful"});
+            defer response.deinit();
+            connection.writeAction(response) catch |err| {
+                std.log.err("failed to send success: {}", .{err});
+                return err;
+            };
+            clientUpdated(allocator, connections) catch |err| {
+                std.log.err("failed to update clients: {}", .{err});
+                return err;
+            };
+            return;
+        }
+    }
+
+    const response = Connection.Data.alloc(allocator, .err, &[_][]const u8{"Invalid username or password"});
+    defer response.deinit();
+    connection.writeAction(response) catch |err| {
+        std.log.err("failed to send failure: {}", .{err});
+        return err;
+    };
+}
+
+fn handleSignup(allocator: std.mem.Allocator, connection: *Connection, connections: []const Connection, data: Connection.Data) !void {
+    if (data.segmentCount() != 2) {
+        return error.InvalidData;
+    }
+
+    const username = data.segment(0);
+    const password = data.segment(1);
+
+    const users = translateUserFile(allocator) catch |err| {
+        std.log.err("failed to translate user file: {}", .{err});
+        return err;
+    };
+    defer freeUsers(users, allocator);
+
+    for (users) |user| {
+        if (std.mem.eql(u8, username, user.username)) {
+            const response = Connection.Data.alloc(allocator, .err, &[_][]const u8{"Username already taken"});
+            defer response.deinit();
+            connection.writeAction(response) catch |err| {
+                std.log.err("failed to send failure: {}", .{err});
+                return err;
+            };
+            return;
+        }
+    }
+
+    addUser(User{ .username = username, .password = password }) catch |err| {
+        std.log.err("failed to add user: {}", .{err});
+        return err;
+    };
+
+    try connection.changeAlias(username);
+
+    const response = Connection.Data.alloc(allocator, .success, &[_][]const u8{"Signup successful"});
+    defer response.deinit();
+    connection.writeAction(response) catch |err| {
+        std.log.err("failed to send success: {}", .{err});
+        return err;
+    };
+    clientUpdated(allocator, connections) catch |err| {
+        std.log.err("failed to update clients: {}", .{err});
+        return err;
+    };
+}
+
 fn broadcast(message: []const u8, exclude: ?Connection, connections: []const Connection) !void {
     for (connections) |connection| {
         if (exclude) |e| {
@@ -84,14 +257,25 @@ fn broadcastData(data: Connection.Data, exclude: ?Connection, connections: []con
 fn clientUpdated(allocator: std.mem.Allocator, connections: []const Connection) !void {
     // loop over connections and format them like alias\n followed by another connection alias
     // then broadcast
+    const message = getList(allocator, connections) catch |err| {
+        std.log.err("failed to get list: {}", .{err});
+        return err;
+    };
+    defer allocator.free(message);
+
+    const response = Connection.Data.alloc(allocator, .on_client_update, &[_][]const u8{message});
+    defer response.deinit();
+
+    try broadcastData(response, null, connections);
+}
+
+fn getList(allocator: std.mem.Allocator, connections: []const Connection) ![]const u8 {
     var message = std.ArrayList(u8).init(allocator);
-    defer message.deinit();
     for (connections) |connection| {
         message.appendSlice(connection.alias) catch unreachable;
         message.append('\n') catch unreachable;
     }
-
-    try broadcastData(Connection.Data.single(.on_client_update, message.items), null, connections);
+    return message.toOwnedSlice();
 }
 
 fn connPrint(message: []const u8, connection: Connection) void {
@@ -175,30 +359,61 @@ fn handleConnection(allocator: std.mem.Allocator, connection: Connection, list: 
                     return;
                 };
             },
-            .user_info => {
-                // user info will come with a username and password (will be encrypted later)
-                if (data.segmentCount() != 2) {
-                    connLog("invalid user info", ptr.*, std.log.err);
-                    return;
-                }
-                const username = data.segment(0);
-                const password = data.segment(1);
-                std.log.info("user info: {s} {s}", .{ username, password });
-                // send error right now
-                const response = Connection.Data.alloc(allocator, .err, &[_][]const u8{"Invalid username or password"});
-                defer response.deinit();
+            .login => {
+                handleLogin(allocator, ptr, list.items, data) catch |err| {
+                    std.log.err("failed to login: {}", .{err});
 
-                std.log.info("sending error", .{});
-                std.log.debug("packet segment 0: {s}", .{response.segment(0)});
+                    // make sure a response is sent back otherwise the client will hang
+                    const response = Connection.Data.alloc(allocator, .err, &[_][]const u8{"Error logging in..."});
+                    defer response.deinit();
+                    ptr.writeAction(response) catch |e| {
+                        std.log.err("failed to send error: {}", .{e});
+                        return;
+                    };
+                };
+            },
+            .signup => {
+                handleSignup(allocator, ptr, list.items, data) catch |err| {
+                    std.log.err("failed to signup: {}", .{err});
 
-                ptr.writeAction(response) catch |err| {
-                    std.log.err("failed to send error: {}", .{err});
-                    return;
+                    // make sure a response is sent back otherwise the client will hang
+                    const response = Connection.Data.alloc(allocator, .err, &[_][]const u8{"Error signing up..."});
+                    defer response.deinit();
+                    ptr.writeAction(response) catch |e| {
+                        std.log.err("failed to send error: {}", .{e});
+                        return;
+                    };
                 };
             },
 
+            // alias: PACKET_LIST client side for getting a list of clients
             .on_client_update => {
-                connLog("invalid permissions... server only", ptr.*, std.log.err);
+                const clients = getList(allocator, list.items) catch |err| {
+                    std.log.err("failed to get list: {}", .{err});
+                    const response = Connection.Data.err(allocator, "Error getting list...");
+                    defer response.deinit();
+                    ptr.writeAction(response) catch |e| {
+                        std.log.err("failed to send error: {}", .{e});
+                        return;
+                    };
+                    continue;
+                };
+                defer allocator.free(clients);
+                const response = Connection.Data.success(allocator, clients);
+                defer response.deinit();
+                connection.writeAction(response) catch |err| {
+                    std.log.err("failed to send success: {}", .{err});
+                    return;
+                };
+            },
+            .get_name => {
+                std.log.debug("sending name", .{});
+                const response = Connection.Data.success(allocator, ptr.alias);
+                defer response.deinit();
+                connection.writeAction(response) catch |err| {
+                    std.log.err("failed to send success: {}", .{err});
+                    return;
+                };
             },
             else => {
                 connLog("Invalid action", ptr.*, std.log.err);

@@ -82,7 +82,7 @@ pub fn readData(self: *Self, allocator: std.mem.Allocator) !Data {
 /// Start reading from the start of the buffer
 /// This is useful if we want to re-use the buffer
 /// This will reset the position to 0 but not clear the buffer because it is unessesary
-pub fn flush(self: Self) void {
+pub fn flush(self: *Self) void {
     self.pos = 0;
     self.start = 0;
 }
@@ -124,6 +124,8 @@ fn bufferedData(self: *Self, allocator: std.mem.Allocator) !?Data {
     var data = Data.init(allocator, action_enum);
 
     if (amount_len == 0) {
+        // no segment but we still need to update start
+        self.start += 2;
         return data;
     }
 
